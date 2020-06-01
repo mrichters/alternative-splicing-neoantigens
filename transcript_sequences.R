@@ -14,8 +14,8 @@ setwd("~/Desktop/Alt_Splicing/runthrough_pipeline/pipeline_results/")
 
 # command line arguments
 args = commandArgs(trailingOnly = T)
-gtf_junctions <- args[1]
-fasta <- args[2]
+gtf_junctions <- "junctions.gtf" #args[1]
+fasta <- "transcripts.fa" #args[2]
 
 get_tumor_sequences <- function(fasta, junction_name, gene_name) {
     seqs <- readDNAStringSet(fasta, "fasta")
@@ -41,15 +41,10 @@ junctions <- as.data.frame(read_tsv(gtf_junctions, col_names = c('seqname', 'sou
 # subset with only transcript lines
 junction_transcripts <- filter(junctions, feature == 'transcript')
 final_tumor_df <- c()
-# loop over transcripts
+# loop over transcripts 
 for ( row in 1:nrow(junction_transcripts) ) {
-    # get strand info
-    #strand <- junction_transcripts[row, "strand"]
-    #if (strand == "-") {
-    stranded <- "+"
-    #} else {
-    #    stranded <- "-"
-    #}
+    # get strand info - shouldn't be needed - strand was specified in getfasta
+    stranded <- junction_transcripts[row, "strand"]
     # list all attributes
     attributes <- unlist(strsplit(str_replace_all(junction_transcripts[row, "attributes"], fixed(" "), ""), ";"))
     # get gene name from attributes

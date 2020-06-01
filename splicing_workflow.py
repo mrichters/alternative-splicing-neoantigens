@@ -10,7 +10,6 @@ import subprocess
 from gtfparse import read_gtf
 from pybiomart import Server, Dataset
 import ensembl_rest
-from time import sleep
 
 def identify_transcripts(gtf_file, regtools_file):
     """Filter GTF tsv file to find tumor junction coordinates from regtools
@@ -22,12 +21,12 @@ def identify_transcripts(gtf_file, regtools_file):
     Returns:
         junctions.gtf (file): filtered gtf only containing transcripts that correspond to regtools junctions
         transcripts.fa (file): fasta file with coding transcript sequences corresponding to junctions.gtf file
-        gtf_transcripts["gene"] (df): list of altered genes
+        gtf_transcripts (df): list of altered transcripts
     """
     # convert gtf to pd df
     gtf_data = read_gtf(gtf_file)
     # read in regtools significant junctions as pd df
-    junctions = pd.read_excel(regtools_file, sheet_name = "Sheet1", usecols = ['chrom', 'start', 'end', 'variant_info', 'strand', 'anchor', 'genes'])
+    junctions = pd.read_csv(regtools_file, sep='\t')
     total_transcripts = {}
     for row_index,row in junctions.iterrows():
         start_exons = gtf_data.loc[(gtf_data['end'] == row["start"]) & (gtf_data["seqname"] == row["chrom"])]
@@ -36,18 +35,20 @@ def identify_transcripts(gtf_file, regtools_file):
         total_transcripts.update(transcript_dict)
     gtf_transcripts = gtf_data.loc[(gtf_data["transcript_id"].isin(total_transcripts.keys())) & (gtf_data["feature"] == "transcript")]
     gtf_transcripts["gene"] = [total_transcripts[x] for x in gtf_transcripts["transcript_id"]]
+    # filter gtf_transcripts
+    if "transcript_type" in gtf_transcripts.columns:
+        gtf_transcripts = gtf_transcripts.loc[gtf_transcripts["transcript_type"] == "protein_coding"]
     # write subsetted gtf file
-    write_file = open(f'{working_dir}/junctions.gtf', "w")
+    write_file = open("junctions.gtf", "w")
     for item, gene in zip(list(gtf_transcripts["transcript_id"]), list(gtf_transcripts["gene"])):
         for line in open(gtf_file).readlines():
             if re.search(item, line):
                 new_line = line.strip() + f' gene_name "{gene}";\n'
                 write_file.write(new_line)
+    write_file.close()
     # create BED12 file from junctions.gtf
-    subprocess.Popen("gtfToGenePred junctions.gtf test.genePhred", shell=True)
-    subprocess.Popen("genePredToBed test.genePhred results.bed", shell=True)
     # create fasta file with transcript (exon-only) sequences
-    subprocess.Popen("bedtools getfasta -fi ~/Documents/ref_fasta/GRCh38.d1.vd1.fa -fo transcripts.fa -bed results.bed -split -name", shell=True)
+    subprocess.Popen("gtfToGenePred junctions.gtf test.genePhred && genePredToBed test.genePhred results.bed && bedtools getfasta -fi ~/Documents/ref_fasta/GRCh38.d1.vd1.fa -fo transcripts.fa -bed results.bed -split -name -s && sed -i.bak -e 's/(-)//' -e 's/(+)//' transcripts.fa", shell=True)
     return gtf_transcripts
 
 def get_ref_proteins(gene_list):
@@ -75,7 +76,16 @@ def get_ref_proteins(gene_list):
     return total_gene_df
 
 def get_tumor_proteins(gtf_file, fasta_file):
-    subprocess.Popen(f'Rscript transcript_sequences.R {gtf_file} {fasta_file}', shell=True)
+    """Run Rscript that uses biomaRt to find tumor protein sequences from junctions.gtf
+
+    Args:
+        gtf_file (file): junctions.gtf created in identify_transcripts()
+        fasta_file (file): transcripts.fa created in identify_transcripts()
+
+    Returns:
+        tumor_sequences.tsv (file): tsv file with tumor sequence, sequence length, and relevant transcript/gene
+    """
+    subprocess.Popen(f'Rscript {original_dir}/transcript_sequences.R {gtf_file} {fasta_file}', shell=True)
 
 def match_sequences(ref_protein_df, tumor_sequences_file):
     """Find sequences that match in reference and tumor plus alteration for neoantigen prediction
@@ -88,7 +98,7 @@ def match_sequences(ref_protein_df, tumor_sequences_file):
         match_df (df): df with full tumor sequences (ref plus alteration)  
     """
     # load dfs
-    reference = ref_protein_df
+    reference = ref_protein
     tumor = pd.read_table("tumor_sequences.tsv")
     # loop over sequences from each transcript per gene
     transcripts = tumor["tumor_id"].unique().tolist()
@@ -99,74 +109,113 @@ def match_sequences(ref_protein_df, tumor_sequences_file):
         tumor_seqs = tumor.loc[tumor["tumor_id"] == trans]
         # only ref sequences that match gene from transcript
         ref_seqs = reference.loc[reference["gene"] == "".join(tumor_seqs["gene"].unique().tolist())]
-        total_seq_counter = 0
-        total_seq_dict = {}
         for p_index, p_row in ref_seqs.iterrows():
             p = ref_seqs.loc[p_index, "protein sequence"]
             for t_index, t_row in tumor_seqs.iterrows():
-                t = tumor.loc[t_index, "peptide"] #tumor_seqs.loc[t_index, "peptide"]
-                match_seq = ''
-                match_seq_counter = 1
-                match_seq_dict = {}
-                mismatch_seq = ''
-                mismatch_seq_counter = 1        
-                mismatch_seq_dict = {}
+                t = tumor.loc[t_index, "peptide"]
+                match_seq = ''; match_seq_counter = 1; match_seq_dict = {}
+                mismatch_seq = ''; mismatch_seq_counter = 1
                 total_seq = ''
+                total_dict = {}
                 if p[0:5] == t[0:5]:
-                    #print("initial match")
+                    print("initial match", p[0:5])
                     for i, (ref,alt) in enumerate(zip(p,t)):
+                        # starting a match seq
                         if i <= 5:
                             # initialize match_seq and add to match (since I already checked that 0:5 matched)
                             match_seq += alt
                         elif i > 5:
                             if ref == alt:
+                                # add to first match seq
                                 if p[i-1] == t[i-1]:
                                     match_seq += alt
+                                    # if at stop codon and whole sequence is a complete match, add to total_seq
+                                    if i == len(p)-1:
+                                        total_seq += match_seq
+                                # start new match seq
                                 if p[i-1] != t[i-1]:
                                     # initialize new match_seq
                                     match_seq = ''
                                     match_seq += alt
+                                    # add mismatch seq back to total seq if this is not the first match seq
                                     if mismatch_seq:
                                         # since now mismatch, add previous mismatch_seq to dictionary
-                                        mismatch_seq_dict[f'mismatch{mismatch_seq_counter}'] = mismatch_seq
+                                        total_dict["end"] = i
+                                        total_dict["mismatch_sequence"] = mismatch_seq
                                         total_seq += mismatch_seq
                                         mismatch_seq_counter += 1
+                            # starting a mismatch seq
                             elif ref != alt:
                                 if p[i-1] == t[i-1]:
                                     # initialize mismatch_seq
                                     mismatch_seq = ''
                                     mismatch_seq += alt
+                                    total_dict["start"] = i
                                     # since now mismatch, add previous match_seq to dictionary
                                     match_seq_dict[f'match{match_seq_counter}'] = match_seq
                                     total_seq += match_seq
                                     match_seq_counter += 1
+                                # continue to add to mismatch seq
                                 if p[i-1] != t[i-1]:
                                     mismatch_seq += alt
+                                    # if mismatch ends with frameshift, add mismatch seq to total_seq
                                     if alt == '*':
-                                        mismatch_seq_dict[f'mismatch{mismatch_seq_counter}'] = mismatch_seq
+                                        total_dict["end"] = i
+                                        total_dict["mismatch_sequence"] = mismatch_seq
                                         total_seq += mismatch_seq
-                    #print(total_seq)
-                    #fasta_expansion = {"classI": }
-                    total_seq_counter += 1
-                    total_seq_dict[f'{trans}_{total_seq_counter}'] = {"total_seq": total_seq, "mismatch": mismatch_seq}
-                    print(total_seq_dict)
-                    completed_seq_dict.update(total_seq_dict)
+                    if total_dict:
+                        total_dict["transcript_id"] = [trans]
+                    print(total_dict)
+                    if total_seq in completed_seq_dict.keys():
+                        completed_seq_dict[total_seq]["transcript_id"].append(trans)
+                    else:    
+                        completed_seq_dict[total_seq] = total_dict
                     total_seq = ''
-                    total_seq_counter = 0
-                    match_seq = ''
-                    match_seq_dict = {}
-                    match_seq_counter = 1
-                    mismatch_seq = ''
-                    mismatch_seq_dict = {}
-                    mismatch_seq_counter = 1
-    return completed_seq_dict
-                
+                    match_seq = ''; match_seq_dict = {}; match_seq_counter = 1
+                    mismatch_seq = ''; mismatch_dict = {}; mismatch_seq_counter = 1
+    final_dict = {"total_sequence": []}
+    for k in completed_seq_dict.keys():
+        final_dict["total_sequence"].append(k)
+        value_dict = completed_seq_dict[k]
+        for key in value_dict.keys():
+            if key in final_dict.keys():
+                final_dict[key].append(value_dict[key])
+            else: 
+                final_dict[key] = [value_dict[key]]
+    final_dict["transcript_id"] = [",".join(item) if len(item) > 1 and isinstance(item, list) else str(item[0]) for item in final_dict["transcript_id"]]
+    final_df = pd.DataFrame(final_dict)  
+    return final_df
+
+def create_fasta(match_df, epitope_lengths=[8,9,10,11,15]):
+    """Create fasta file with altered transcript sequences for input into pVACbind
+
+    Args:
+        match_df (df): output from match_sequences that contains the total transcript sequences and mismatch portion that will be used to create fasta sequence
+        epitope_lengths (list): desired epitope lengths for pVACbind
+
+    Returns:
+        pvacbind_sequences.fa (file): fasta file for input into pVACbind 
+    """
+    write_file = open("pvacbind_sequences.fa", "w")
+    for row_index, row in match_df.iterrows():
+        fasta_seqs = [match_df.loc[row_index, "total_sequence"][match_df.loc[row_index, "start"] - l:match_df.loc[row_index, "end"]] for l in epitope_lengths]
+        fasta_headers = [f'>{match_df.loc[row_index, "transcript_id"]} length{l}' for l in epitope_lengths]
+        for x,y in zip(fasta_seqs, fasta_headers):
+            new_line = f'{y}\n{x}\n\n'
+            write_file.write(new_line)
+    write_file.close()
+
 # get working dir
-working_dir = os.getcwd()
+original_dir = os.getcwd()
+working_dir = '/Users/mrichters/Desktop/Alt_Splicing/runthrough_pipeline/'
+results_dir = working_dir + 'pipeline_results'
+os.chdir(results_dir)
 
 # input files
-gtf_file = '/Users/mrichters/Desktop/Alt_Splicing/runthrough_pipeline/BrMET019-1.denovo.transcripts.gtf'
-regtools_file = '/Users/mrichters/Desktop/Alt_Splicing/runthrough_pipeline/all_splicing_variants_default_format.bed_out.xlsx'
+gtf_file = working_dir + 'BrMET019-1.denovo.transcripts.gtf'
+regtools_file = working_dir + 'KLHL5_BrMET019-1.tsv'
+#gtf_file = working_dir + 'gencode.v22.annotation.gtf'
+#regtools_file = working_dir + 'RNF145_sampleline.tsv'
 
 junctions_gtf = identify_transcripts(gtf_file, regtools_file)
 
@@ -174,6 +223,6 @@ ref_protein = get_ref_proteins(junctions_gtf["gene"].unique().tolist())
 
 get_tumor_proteins("junctions.gtf", "transcripts.fa")
 
-match_dict = match_sequences(ref_protein, "tumor_sequences.tsv")
+match_df = match_sequences(ref_protein, "tumor_sequences.tsv")
 
-
+create_fasta(match_df)
