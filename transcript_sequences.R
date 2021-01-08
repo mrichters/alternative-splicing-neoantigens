@@ -10,12 +10,12 @@ library(seqinr)
 library(Biostrings)
 
 # setwd
-setwd("~/Desktop/Alt_Splicing/runthrough_pipeline/pipeline_results/")
+#setwd("~/Desktop/Alt_Splicing/runthrough_pipeline/pipeline_results/")
 
 # command line arguments
 args = commandArgs(trailingOnly = T)
-gtf_junctions <- "junctions.gtf" #args[1]
-fasta <- "transcripts.fa" #args[2]
+gtf_junctions <- args[1]
+fasta <- args[2]
 
 get_tumor_sequences <- function(fasta, junction_name, gene_name) {
     seqs <- readDNAStringSet(fasta, "fasta")
